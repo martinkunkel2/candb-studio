@@ -1,4 +1,6 @@
 import type { IValidationService } from '../../core/interfaces/database/IValidationService';
+import { ByteOrder } from '../../core/enums/ByteOrder';
+import { signalPhysicalBits } from '../../core/layout/bitOccupancy';
 import type { CanDatabase } from '../../core/models/database/CanDatabase';
 import type { DiagnosticItem } from '../../core/types';
 import { DiagnosticSeverity } from '../../core/types';
@@ -9,6 +11,9 @@ import {
     MAX_EXTENDED_CAN_ID,
     MAX_STANDARD_CAN_ID,
 } from '../../shared/constants';
+
+/** DBC marks extended (29-bit) frame IDs by setting bit 31 of the BO_ ID. */
+const DBC_EXTENDED_ID_FLAG = 0x80000000;
 
 /**
  * Validates a CAN database for correctness and consistency.
@@ -45,14 +50,16 @@ export class ValidationService implements IValidationService {
             }
             namesSeen.set(message.name, message.id);
 
-            // ID range
-            if (message.id < 0 || message.id > MAX_EXTENDED_CAN_ID) {
+            // ID range (DBC stores extended IDs with bit 31 set, e.g. 0x892A3F65 for 0x092A3F65)
+            const isExtended = message.id >= DBC_EXTENDED_ID_FLAG;
+            const canId = isExtended ? message.id - DBC_EXTENDED_ID_FLAG : message.id;
+            if (canId < 0 || canId > MAX_EXTENDED_CAN_ID) {
                 diagnostics.push({
                     severity: DiagnosticSeverity.Error,
                     message: `Message ID ${message.id} is out of valid range [0, ${MAX_EXTENDED_CAN_ID}]`,
                     path: `${prefix}.id`,
                 });
-            } else if (message.id > MAX_STANDARD_CAN_ID) {
+            } else if (isExtended || canId > MAX_STANDARD_CAN_ID) {
                 diagnostics.push({
                     severity: DiagnosticSeverity.Info,
                     message: `Message ID ${message.idHex} is an extended (29-bit) frame ID`,
@@ -118,8 +125,17 @@ export class ValidationService implements IValidationService {
                     });
                 }
 
+                // Intel: startBit is the LSB and the signal grows upwards. Motorola: startBit is the
+                // MSB and the signal runs downwards into the following bytes (sawtooth), so
+                // startBit + bitLength is meaningless there. Check the bits actually occupied.
                 const maxBit = message.dlc * 8;
-                if (signal.startBit + signal.bitLength > maxBit) {
+                const bits = signalPhysicalBits({
+                    startBit: signal.startBit,
+                    bitLength: signal.bitLength,
+                    byteOrder:
+                        signal.byteOrder === ByteOrder.BigEndian ? 'big_endian' : 'little_endian',
+                });
+                if (bits.some((b) => b < 0 || b >= maxBit)) {
                     diagnostics.push({
                         severity: DiagnosticSeverity.Error,
                         message: `Signal "${signal.name}" extends beyond message payload (startBit=${signal.startBit}, bitLength=${signal.bitLength}, maxBit=${maxBit})`,
